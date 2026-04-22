@@ -1,40 +1,68 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { z } from "zod";
-import { analyzeTranscript } from "@/lib/claude";
-import { getMeetingForOwner, saveMeetingAnalysis } from "@/lib/db";
-import { getSessionFromRequest } from "@/lib/paywall";
+import { requireApiAccess } from "@/lib/auth";
+import { analyzeTranscriptWithClaude } from "@/lib/claude";
+import { getJobById, markJobFailed, updateJobAnalysis } from "@/lib/db";
+
+const requestSchema = z.object({
+  jobId: z.string().min(1),
+});
 
 export const runtime = "nodejs";
 
-const schema = z.object({
-  meetingId: z.string().uuid()
-});
+function humanizeError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
 
-export async function POST(request: NextRequest) {
-  const session = getSessionFromRequest(request);
+  return "Unexpected analysis error.";
+}
 
-  if (!session) {
-    return NextResponse.json({ error: "Purchase required before using analysis." }, { status: 401 });
+export async function POST(request: Request): Promise<NextResponse> {
+  const blockedResponse = await requireApiAccess();
+  if (blockedResponse) {
+    return blockedResponse;
+  }
+
+  const payload = await request.json().catch(() => null);
+  const parsed = requestSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    return NextResponse.json({ error: "Request body must include a valid jobId." }, { status: 400 });
+  }
+
+  const job = await getJobById(parsed.data.jobId);
+  if (!job) {
+    return NextResponse.json({ error: "Job not found." }, { status: 404 });
+  }
+
+  if (!job.transcription) {
+    return NextResponse.json(
+      { error: "Job has no transcript yet. Run /api/transcribe first." },
+      { status: 400 },
+    );
+  }
+
+  if (job.analysis) {
+    return NextResponse.json({
+      jobId: job.id,
+      analysis: job.analysis,
+      cached: true,
+    });
   }
 
   try {
-    const { meetingId } = schema.parse(await request.json());
+    const analysis = await analyzeTranscriptWithClaude(job.transcription);
+    await updateJobAnalysis(job.id, analysis);
 
-    const meeting = getMeetingForOwner(meetingId, session.email);
-    if (!meeting) {
-      return NextResponse.json({ error: "Meeting not found." }, { status: 404 });
-    }
-
-    if (meeting.analysis) {
-      return NextResponse.json({ analysis: meeting.analysis });
-    }
-
-    const analysis = await analyzeTranscript(meeting.transcript);
-    saveMeetingAnalysis(meetingId, analysis);
-
-    return NextResponse.json({ analysis });
+    return NextResponse.json({
+      jobId: job.id,
+      analysis,
+    });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Analysis failed unexpectedly.";
+    const message = humanizeError(error);
+    await markJobFailed(job.id, message);
+
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

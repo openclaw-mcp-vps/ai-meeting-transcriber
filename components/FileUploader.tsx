@@ -2,128 +2,145 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { Upload, Link2, Loader2 } from "lucide-react";
+import { Loader2, UploadCloud } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Card, CardDescription, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 
-export function FileUploader() {
+interface ApiErrorPayload {
+  error?: string;
+}
+
+export default function FileUploader() {
   const router = useRouter();
-  const [mode, setMode] = useState<"file" | "url">("file");
-  const [file, setFile] = useState<File | null>(null);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [recordingUrl, setRecordingUrl] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [status, setStatus] = useState("");
-  const [error, setError] = useState("");
+  const [statusMessage, setStatusMessage] = useState("Upload a recording to begin.");
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  const runPipeline = async () => {
-    setError("");
+  const onSubmit = async (event: React.FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault();
+    setErrorMessage(null);
 
-    if (mode === "file" && !file) {
-      setError("Select an .mp3 or .mp4 file to continue.");
-      return;
-    }
-
-    if (mode === "url" && !recordingUrl.trim()) {
-      setError("Paste a Zoom or direct recording URL to continue.");
+    if (!selectedFile && recordingUrl.trim().length === 0) {
+      setErrorMessage("Attach an .mp3/.mp4 file or provide a recording URL.");
       return;
     }
 
     setIsSubmitting(true);
 
     try {
-      setStatus("Uploading recording and generating transcript...");
       const formData = new FormData();
-
-      if (mode === "file" && file) {
-        formData.append("file", file);
+      if (selectedFile) {
+        formData.append("file", selectedFile);
       }
-
-      if (mode === "url") {
+      if (recordingUrl.trim().length > 0) {
         formData.append("recordingUrl", recordingUrl.trim());
       }
 
+      setStatusMessage("Transcribing with Whisper...");
       const transcribeResponse = await fetch("/api/transcribe", {
         method: "POST",
-        body: formData
+        body: formData,
       });
 
-      const transcribePayload = (await transcribeResponse.json()) as {
-        error?: string;
-        meetingId?: string;
-      };
+      const transcribePayload = (await transcribeResponse.json()) as
+        | { jobId: string }
+        | ApiErrorPayload;
 
-      if (!transcribeResponse.ok || !transcribePayload.meetingId) {
-        throw new Error(transcribePayload.error ?? "Unable to transcribe meeting.");
+      if (!transcribeResponse.ok || !("jobId" in transcribePayload)) {
+        throw new Error(
+          (transcribePayload as ApiErrorPayload).error ??
+            "Transcription failed. Confirm your recording is reachable and under 25MB.",
+        );
       }
 
-      setStatus("Extracting action items and speaker sentiment...");
+      const jobId = transcribePayload.jobId;
+
+      setStatusMessage("Extracting action items and speaker sentiment with Claude...");
       const analyzeResponse = await fetch("/api/analyze", {
         method: "POST",
         headers: {
-          "Content-Type": "application/json"
+          "content-type": "application/json",
         },
-        body: JSON.stringify({ meetingId: transcribePayload.meetingId })
+        body: JSON.stringify({ jobId }),
       });
 
-      const analyzePayload = (await analyzeResponse.json()) as { error?: string };
+      const analyzePayload = (await analyzeResponse.json()) as ApiErrorPayload;
       if (!analyzeResponse.ok) {
-        throw new Error(analyzePayload.error ?? "Unable to analyze transcript.");
+        throw new Error(analyzePayload.error ?? "Analysis failed.");
       }
 
-      router.push(`/results/${transcribePayload.meetingId}`);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unexpected error while processing meeting.");
+      setStatusMessage("Done. Opening your meeting report...");
+      router.push(`/results/${jobId}`);
+    } catch (submitError) {
+      setErrorMessage(submitError instanceof Error ? submitError.message : "Unexpected error.");
+      setStatusMessage("Upload a recording to begin.");
     } finally {
       setIsSubmitting(false);
-      setStatus("");
     }
   };
 
   return (
-    <Card className="space-y-4 p-5 sm:p-6">
-      <div>
-        <CardTitle>Upload Meeting Recording</CardTitle>
-        <CardDescription>
-          Works with `.mp3` and `.mp4` files up to 25MB, or paste a recording URL from Zoom cloud.
-        </CardDescription>
-      </div>
+    <Card className="border-slate-700 bg-slate-900/70">
+      <CardHeader>
+        <CardTitle className="text-xl">New Meeting</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <form onSubmit={onSubmit} className="space-y-6">
+          <div className="space-y-2">
+            <label htmlFor="meeting-file" className="text-sm font-medium text-slate-300">
+              Upload audio/video
+            </label>
+            <Input
+              id="meeting-file"
+              type="file"
+              accept=".mp3,.mp4,.m4a,.wav,.webm"
+              onChange={(event) => {
+                const nextFile = event.target.files?.[0] ?? null;
+                setSelectedFile(nextFile);
+              }}
+            />
+            <p className="text-xs text-slate-500">
+              Whisper supports files up to 25MB. Split long meetings into parts if needed.
+            </p>
+          </div>
 
-      <div className="grid grid-cols-2 gap-2">
-        <Button variant={mode === "file" ? "default" : "secondary"} onClick={() => setMode("file")}>
-          <Upload className="mr-2 size-4" />
-          File Upload
-        </Button>
-        <Button variant={mode === "url" ? "default" : "secondary"} onClick={() => setMode("url")}>
-          <Link2 className="mr-2 size-4" />
-          Recording URL
-        </Button>
-      </div>
+          <div className="space-y-2">
+            <label htmlFor="recording-url" className="text-sm font-medium text-slate-300">
+              Or paste recording URL
+            </label>
+            <Input
+              id="recording-url"
+              type="url"
+              placeholder="https://zoom.us/rec/download/..."
+              value={recordingUrl}
+              onChange={(event) => setRecordingUrl(event.target.value)}
+            />
+            <p className="text-xs text-slate-500">
+              Use direct download links (Zoom cloud recording links work when public or authenticated).
+            </p>
+          </div>
 
-      {mode === "file" ? (
-        <Input
-          type="file"
-          accept="audio/mpeg,video/mp4,audio/mp3"
-          onChange={(event) => {
-            const nextFile = event.target.files?.[0] ?? null;
-            setFile(nextFile);
-          }}
-        />
-      ) : (
-        <Input
-          placeholder="https://zoom.us/rec/share/..."
-          value={recordingUrl}
-          onChange={(event) => setRecordingUrl(event.target.value)}
-        />
-      )}
+          <Button type="submit" disabled={isSubmitting} className="w-full">
+            {isSubmitting ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin" />
+                Processing Meeting
+              </>
+            ) : (
+              <>
+                <UploadCloud className="h-4 w-4" />
+                Transcribe + Analyze
+              </>
+            )}
+          </Button>
 
-      {status ? <p className="text-sm text-emerald-300">{status}</p> : null}
-      {error ? <p className="text-sm text-rose-300">{error}</p> : null}
-
-      <Button className="w-full" size="lg" disabled={isSubmitting} onClick={runPipeline}>
-        {isSubmitting ? <Loader2 className="mr-2 size-4 animate-spin" /> : null}
-        {isSubmitting ? "Processing Meeting..." : "Transcribe and Analyze"}
-      </Button>
+          <p className="text-sm text-slate-300">{statusMessage}</p>
+          {errorMessage ? <p className="text-sm text-rose-300">{errorMessage}</p> : null}
+        </form>
+      </CardContent>
     </Card>
   );
 }

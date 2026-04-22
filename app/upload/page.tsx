@@ -1,49 +1,27 @@
 import { redirect } from "next/navigation";
-import { FileUploader } from "@/components/FileUploader";
-import { Card, CardDescription, CardTitle } from "@/components/ui/card";
-import { getUsage } from "@/lib/db";
-import { getSessionFromCookies } from "@/lib/paywall";
+import FileUploader from "@/components/FileUploader";
+import { hasValidAccessCookie } from "@/lib/auth";
+
+export const metadata = {
+  title: "Upload Meeting",
+  description: "Upload a recording or paste a meeting URL to generate transcript and action items.",
+};
 
 export default async function UploadPage() {
-  const session = await getSessionFromCookies();
-
-  if (!session) {
-    redirect("/");
+  const hasAccess = await hasValidAccessCookie();
+  if (!hasAccess) {
+    redirect("/?locked=1");
   }
 
-  const usage = getUsage(session.email);
-  const usedMinutes = (usage.usedSeconds / 60).toFixed(1);
-  const includedMinutes = usage.hasMonthlyPlan ? (usage.includedSeconds / 60).toFixed(0) : "0";
-  const overageMinutes = (usage.overageSeconds / 60).toFixed(1);
-
   return (
-    <main className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-4 py-10 sm:px-6 lg:px-8">
-      <section className="space-y-2">
-        <h1 className="text-3xl font-semibold text-white">Meeting Workspace</h1>
+    <main className="mx-auto max-w-3xl px-4 py-12 sm:px-6 lg:px-8">
+      <header className="mb-8 space-y-2">
+        <h1 className="text-3xl font-bold">Upload Recording</h1>
         <p className="text-slate-300">
-          Upload audio/video or paste a recording URL. You&apos;ll receive a transcript, action items, and sentiment per
-          speaker.
+          Add an .mp3/.mp4 file or paste a Zoom recording URL. We transcribe with Whisper, then extract action
+          items and speaker sentiment with Claude.
         </p>
-      </section>
-
-      <div className="grid gap-4 md:grid-cols-2">
-        <Card>
-          <CardTitle className="mb-1 text-base">Current Usage ({usage.month})</CardTitle>
-          <CardDescription>{usedMinutes} minutes processed this month.</CardDescription>
-          <p className="mt-3 text-sm text-slate-300">
-            {usage.hasMonthlyPlan
-              ? `${includedMinutes} included minutes on your monthly plan. ${overageMinutes} minutes above plan are billed at $0.10/min.`
-              : "You are on pay-as-you-go billing at $0.10 per minute."}
-          </p>
-        </Card>
-
-        <Card>
-          <CardTitle className="mb-1 text-base">Tip for Faster Turnaround</CardTitle>
-          <CardDescription>
-            For long calls, export Zoom cloud recordings as MP3 before upload. Smaller files finish faster and reduce failed uploads.
-          </CardDescription>
-        </Card>
-      </div>
+      </header>
 
       <FileUploader />
     </main>

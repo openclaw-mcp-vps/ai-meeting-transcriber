@@ -1,215 +1,221 @@
-import fs from "node:fs";
-import path from "node:path";
 import crypto from "node:crypto";
-import {
-  AnalysisResult,
-  DatabaseShape,
-  MeetingRecord,
-  OrderRecord,
-  UsageRecord
+import fs from "node:fs/promises";
+import path from "node:path";
+import type {
+  AccessSession,
+  AnalysisData,
+  JobRecord,
+  SourceType,
+  StoreData,
+  TranscriptData,
 } from "@/lib/types";
 
-const DATA_DIR = path.join(process.cwd(), ".data");
-const DATA_FILE = path.join(DATA_DIR, "db.json");
-const MONTHLY_PLAN_SECONDS = 10 * 60 * 60;
+const STORE_DIRECTORY = path.join(process.cwd(), "data");
+const STORE_PATH = path.join(STORE_DIRECTORY, "store.json");
 
-const EMPTY_DB: DatabaseShape = {
-  meetings: [],
-  orders: [],
-  usage: []
+const DEFAULT_STORE: StoreData = {
+  jobs: [],
+  purchases: [],
+  sessions: [],
+  processedWebhookEvents: [],
 };
 
-function ensureDbFile() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
+let mutationQueue: Promise<void> = Promise.resolve();
 
-  if (!fs.existsSync(DATA_FILE)) {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(EMPTY_DB, null, 2), "utf-8");
+async function ensureStoreExists(): Promise<void> {
+  await fs.mkdir(STORE_DIRECTORY, { recursive: true });
+  try {
+    await fs.access(STORE_PATH);
+  } catch {
+    await fs.writeFile(STORE_PATH, JSON.stringify(DEFAULT_STORE, null, 2), "utf8");
   }
 }
 
-function loadDb(): DatabaseShape {
-  ensureDbFile();
-  const raw = fs.readFileSync(DATA_FILE, "utf-8");
+async function readStore(): Promise<StoreData> {
+  await ensureStoreExists();
+  const raw = await fs.readFile(STORE_PATH, "utf8");
 
   try {
-    const parsed = JSON.parse(raw) as Partial<DatabaseShape>;
+    const parsed = JSON.parse(raw) as Partial<StoreData>;
     return {
-      meetings: parsed.meetings ?? [],
-      orders: parsed.orders ?? [],
-      usage: parsed.usage ?? []
+      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [],
+      purchases: Array.isArray(parsed.purchases) ? parsed.purchases : [],
+      sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
+      processedWebhookEvents: Array.isArray(parsed.processedWebhookEvents)
+        ? parsed.processedWebhookEvents
+        : [],
     };
   } catch {
-    return { ...EMPTY_DB };
+    return structuredClone(DEFAULT_STORE);
   }
 }
 
-function saveDb(db: DatabaseShape) {
-  ensureDbFile();
-  const tempFile = `${DATA_FILE}.tmp`;
-  fs.writeFileSync(tempFile, JSON.stringify(db, null, 2), "utf-8");
-  fs.renameSync(tempFile, DATA_FILE);
+async function writeStore(store: StoreData): Promise<void> {
+  await ensureStoreExists();
+  const tempPath = `${STORE_PATH}.tmp`;
+  await fs.writeFile(tempPath, JSON.stringify(store, null, 2), "utf8");
+  await fs.rename(tempPath, STORE_PATH);
 }
 
-function normalizeEmail(email: string) {
-  return email.trim().toLowerCase();
+async function mutateStore<T>(mutator: (store: StoreData) => Promise<T> | T): Promise<T> {
+  const run = mutationQueue.then(async () => {
+    const store = await readStore();
+    const result = await mutator(store);
+    await writeStore(store);
+    return result;
+  });
+
+  mutationQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+
+  return run;
 }
 
-function getCurrentMonthKey(date = new Date()) {
-  return date.toISOString().slice(0, 7);
-}
+export async function createJob(input: { sourceType: SourceType; sourceName: string }): Promise<JobRecord> {
+  const now = new Date().toISOString();
+  const job: JobRecord = {
+    id: crypto.randomUUID(),
+    createdAt: now,
+    updatedAt: now,
+    sourceType: input.sourceType,
+    sourceName: input.sourceName,
+    status: "uploaded",
+  };
 
-function detectPlan(status: string, planHint?: string): OrderRecord["plan"] {
-  const source = `${status} ${planHint ?? ""}`.toLowerCase();
-  if (source.includes("monthly") || source.includes("10 hour") || source.includes("subscription")) {
-    return "monthly";
-  }
-
-  return "payg";
-}
-
-export function recordOrder(input: {
-  orderId: string;
-  email: string;
-  status: string;
-  planHint?: string;
-}) {
-  const db = loadDb();
-  const email = normalizeEmail(input.email);
-  const existing = db.orders.find((order) => order.orderId === input.orderId);
-
-  if (existing) {
-    existing.email = email;
-    existing.status = input.status;
-    existing.updatedAt = new Date().toISOString();
-    existing.plan = detectPlan(input.status, input.planHint);
-  } else {
-    const now = new Date().toISOString();
-    db.orders.push({
-      orderId: input.orderId,
-      email,
-      status: input.status,
-      plan: detectPlan(input.status, input.planHint),
-      createdAt: now,
-      updatedAt: now
-    });
-  }
-
-  saveDb(db);
-}
-
-export function hasPaidAccess(email: string): boolean {
-  const db = loadDb();
-  const normalized = normalizeEmail(email);
-
-  return db.orders.some((order) => {
-    if (order.email !== normalized) {
-      return false;
-    }
-
-    const status = order.status.toLowerCase();
-    return ["paid", "active", "on_trial", "processing"].some((allowed) =>
-      status.includes(allowed)
-    );
+  return mutateStore((store) => {
+    store.jobs.unshift(job);
+    return job;
   });
 }
 
-export function createMeeting(input: {
-  ownerEmail: string;
-  sourceType: MeetingRecord["sourceType"];
-  sourceName: string;
-  durationSeconds: number;
-  transcript: string;
-}) {
-  const db = loadDb();
+export async function updateJobTranscription(id: string, transcription: TranscriptData): Promise<void> {
+  await mutateStore((store) => {
+    const job = store.jobs.find((record) => record.id === id);
+    if (!job) {
+      throw new Error("Job not found.");
+    }
 
-  const meeting: MeetingRecord = {
-    id: crypto.randomUUID(),
-    ownerEmail: normalizeEmail(input.ownerEmail),
-    createdAt: new Date().toISOString(),
-    sourceType: input.sourceType,
-    sourceName: input.sourceName,
-    durationSeconds: input.durationSeconds,
-    transcript: input.transcript,
-    analysis: null
-  };
-
-  db.meetings.push(meeting);
-  saveDb(db);
-  return meeting;
+    job.transcription = transcription;
+    job.status = "transcribed";
+    job.updatedAt = new Date().toISOString();
+    delete job.error;
+  });
 }
 
-export function getMeetingById(id: string) {
-  const db = loadDb();
-  return db.meetings.find((meeting) => meeting.id === id) ?? null;
+export async function updateJobAnalysis(id: string, analysis: AnalysisData): Promise<void> {
+  await mutateStore((store) => {
+    const job = store.jobs.find((record) => record.id === id);
+    if (!job) {
+      throw new Error("Job not found.");
+    }
+
+    job.analysis = analysis;
+    job.status = "analyzed";
+    job.updatedAt = new Date().toISOString();
+    delete job.error;
+  });
 }
 
-export function getMeetingForOwner(id: string, ownerEmail: string) {
-  const meeting = getMeetingById(id);
-  if (!meeting) {
-    return null;
-  }
+export async function markJobFailed(id: string, message: string): Promise<void> {
+  await mutateStore((store) => {
+    const job = store.jobs.find((record) => record.id === id);
+    if (!job) {
+      return;
+    }
 
-  if (meeting.ownerEmail !== normalizeEmail(ownerEmail)) {
-    return null;
-  }
-
-  return meeting;
+    job.status = "failed";
+    job.error = message;
+    job.updatedAt = new Date().toISOString();
+  });
 }
 
-export function saveMeetingAnalysis(id: string, analysis: AnalysisResult) {
-  const db = loadDb();
-  const meeting = db.meetings.find((item) => item.id === id);
-
-  if (!meeting) {
-    return null;
-  }
-
-  meeting.analysis = analysis;
-  saveDb(db);
-  return meeting;
+export async function getJobById(id: string): Promise<JobRecord | null> {
+  const store = await readStore();
+  const job = store.jobs.find((record) => record.id === id);
+  return job ?? null;
 }
 
-export function recordUsage(email: string, seconds: number) {
-  const db = loadDb();
+function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+export async function recordStripePurchase(input: {
+  email: string;
+  eventId: string;
+  amountCents: number | null;
+  currency: string | null;
+}): Promise<void> {
+  await mutateStore((store) => {
+    if (store.processedWebhookEvents.includes(input.eventId)) {
+      return;
+    }
+
+    store.processedWebhookEvents.push(input.eventId);
+
+    store.purchases.unshift({
+      email: normalizeEmail(input.email),
+      createdAt: new Date().toISOString(),
+      source: "stripe",
+      eventId: input.eventId,
+      amountCents: input.amountCents,
+      currency: input.currency,
+    });
+  });
+}
+
+export async function hasPaidAccess(email: string): Promise<boolean> {
   const normalized = normalizeEmail(email);
-  const month = getCurrentMonthKey();
+  const store = await readStore();
+  return store.purchases.some((purchase) => purchase.email === normalized);
+}
 
-  const usage = db.usage.find((item) => item.email === normalized && item.month === month);
-  if (usage) {
-    usage.secondsUsed += seconds;
-  } else {
-    const entry: UsageRecord = {
+function removeExpiredSessions(sessions: AccessSession[]): AccessSession[] {
+  const now = Date.now();
+  return sessions.filter((session) => new Date(session.expiresAt).getTime() > now);
+}
+
+export async function createAccessSession(email: string): Promise<string> {
+  const normalized = normalizeEmail(email);
+  const now = new Date();
+  const expires = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+  const token = crypto.randomBytes(32).toString("hex");
+
+  await mutateStore((store) => {
+    store.sessions = removeExpiredSessions(store.sessions);
+
+    store.sessions.push({
+      token,
       email: normalized,
-      month,
-      secondsUsed: seconds
-    };
-    db.usage.push(entry);
-  }
+      createdAt: now.toISOString(),
+      expiresAt: expires.toISOString(),
+    });
+  });
 
-  saveDb(db);
+  return token;
 }
 
-export function getUsage(email: string) {
-  const db = loadDb();
-  const normalized = normalizeEmail(email);
-  const month = getCurrentMonthKey();
-  const usedSeconds =
-    db.usage.find((item) => item.email === normalized && item.month === month)?.secondsUsed ?? 0;
+export async function validateAccessSession(token: string): Promise<{ email: string } | null> {
+  const store = await readStore();
+  const activeSessions = removeExpiredSessions(store.sessions);
 
-  const activeMonthlyOrder = [...db.orders]
-    .reverse()
-    .find((order) => order.email === normalized && order.plan === "monthly");
+  if (activeSessions.length !== store.sessions.length) {
+    await mutateStore((innerStore) => {
+      innerStore.sessions = removeExpiredSessions(innerStore.sessions);
+    });
+  }
 
-  const hasMonthlyPlan = Boolean(activeMonthlyOrder);
-  const includedSeconds = hasMonthlyPlan ? MONTHLY_PLAN_SECONDS : 0;
+  const session = activeSessions.find((entry) => entry.token === token);
+  if (!session) {
+    return null;
+  }
 
-  return {
-    month,
-    usedSeconds,
-    includedSeconds,
-    overageSeconds: Math.max(0, usedSeconds - includedSeconds),
-    hasMonthlyPlan
-  };
+  return { email: session.email };
+}
+
+export async function revokeAccessSession(token: string): Promise<void> {
+  await mutateStore((store) => {
+    store.sessions = store.sessions.filter((session) => session.token !== token);
+  });
 }

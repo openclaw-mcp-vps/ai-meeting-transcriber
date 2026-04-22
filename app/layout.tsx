@@ -1,65 +1,46 @@
 import type { Metadata } from "next";
-import { Space_Grotesk, Source_Sans_3 } from "next/font/google";
-import "@/app/globals.css";
+import "./globals.css";
 
-const heading = Space_Grotesk({
-  subsets: ["latin"],
-  variable: "--font-heading"
-});
-
-const body = Source_Sans_3({
-  subsets: ["latin"],
-  variable: "--font-body"
-});
+const defaultTitle = "AI Meeting Transcriber";
+const defaultDescription =
+  "Drop a recording URL or upload audio/video to get a transcript, action items assigned to names, and per-speaker sentiment in minutes.";
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://ai-meeting-transcriber.app"),
+  metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"),
   title: {
-    default: "AI Meeting Transcriber | Transcript, Action Items, Sentiment",
-    template: "%s | AI Meeting Transcriber"
+    default: defaultTitle,
+    template: `%s | ${defaultTitle}`,
   },
-  description:
-    "Upload an .mp3/.mp4 or paste a Zoom recording URL. Whisper creates a transcript, Claude extracts owner-assigned action items, and speaker sentiment is tagged in minutes.",
+  description: defaultDescription,
+  keywords: [
+    "AI meeting transcription",
+    "meeting action items",
+    "speaker sentiment",
+    "founder productivity",
+    "meeting notes",
+  ],
   openGraph: {
-    title: "AI Meeting Transcriber",
-    description:
-      "Skip $18/user subscriptions. Pay only for minutes processed and get transcript, action items, and speaker sentiment from every meeting.",
-    url: "https://ai-meeting-transcriber.app",
-    siteName: "AI Meeting Transcriber",
-    images: [
-      {
-        url: "/opengraph-image",
-        width: 1200,
-        height: 630,
-        alt: "AI Meeting Transcriber dashboard preview"
-      }
-    ],
-    locale: "en_US",
-    type: "website"
+    title: defaultTitle,
+    description: defaultDescription,
+    url: "/",
+    siteName: defaultTitle,
+    type: "website",
   },
   twitter: {
     card: "summary_large_image",
-    title: "AI Meeting Transcriber",
-    description:
-      "Drop a recording URL, get clean transcript + owner-assigned tasks + sentiment by speaker.",
-    images: ["/opengraph-image"]
+    title: defaultTitle,
+    description: defaultDescription,
   },
   robots: {
     index: true,
-    follow: true
-  }
+    follow: true,
+  },
 };
 
-export default function RootLayout({
-  children
-}: Readonly<{
-  children: React.ReactNode;
-}>) {
+export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
-      <body className={`${heading.variable} ${body.variable} bg-[#0d1117] text-slate-100 antialiased`}>
-        {children}
-      </body>
+      <body className="bg-[#0d1117] text-slate-100 antialiased">{children}</body>
     </html>
   );
 }

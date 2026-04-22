@@ -1,72 +1,91 @@
-import { NextRequest, NextResponse } from "next/server";
-import { createMeeting, recordUsage } from "@/lib/db";
-import { getSessionFromRequest } from "@/lib/paywall";
-import { recordingUrlToFile, transcribeMeeting } from "@/lib/whisper";
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import { markJobFailed, createJob, updateJobTranscription } from "@/lib/db";
+import { requireApiAccess } from "@/lib/auth";
+import { fetchRemoteRecording, transcribeMeetingAudio } from "@/lib/whisper";
 
 export const runtime = "nodejs";
 
-const ALLOWED_MIME_TYPES = new Set(["audio/mpeg", "audio/mp3", "video/mp4"]);
-
-export async function POST(request: NextRequest) {
-  const session = getSessionFromRequest(request);
-
-  if (!session) {
-    return NextResponse.json({ error: "Purchase required before using transcription." }, { status: 401 });
+function humanizeError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
   }
 
+  return "Unexpected transcription error.";
+}
+
+const recordingUrlSchema = z.string().url();
+
+export async function POST(request: Request): Promise<NextResponse> {
+  const blockedResponse = await requireApiAccess();
+  if (blockedResponse) {
+    return blockedResponse;
+  }
+
+  const formData = await request.formData();
+  const maybeFile = formData.get("file");
+  const maybeUrl = formData.get("recordingUrl");
+
+  const hasFile = maybeFile instanceof File && maybeFile.size > 0;
+  const recordingUrl = typeof maybeUrl === "string" ? maybeUrl.trim() : "";
+
+  if (!hasFile && recordingUrl.length === 0) {
+    return NextResponse.json(
+      { error: "Provide either a file upload or a recording URL." },
+      { status: 400 },
+    );
+  }
+
+  if (recordingUrl.length > 0) {
+    const urlCheck = recordingUrlSchema.safeParse(recordingUrl);
+    if (!urlCheck.success) {
+      return NextResponse.json({ error: "Recording URL is not a valid URL." }, { status: 400 });
+    }
+  }
+
+  const sourceType = hasFile ? "file" : "url";
+  const sourceName = hasFile ? (maybeFile as File).name : recordingUrl;
+
+  const job = await createJob({ sourceType, sourceName });
+
   try {
-    const formData = await request.formData();
-    const fileInput = formData.get("file");
-    const recordingUrlInput = formData.get("recordingUrl");
+    let buffer: Buffer;
+    let filename: string;
+    let mimeType: string;
 
-    let file: File | null = null;
-    let sourceType: "file" | "url" = "file";
-    let sourceName = "Uploaded recording";
-
-    if (fileInput instanceof File && fileInput.size > 0) {
-      file = fileInput;
-      sourceType = "file";
-      sourceName = file.name;
-
-      if (file.type && !ALLOWED_MIME_TYPES.has(file.type)) {
-        return NextResponse.json(
-          { error: "Only .mp3 and .mp4 files are currently supported." },
-          { status: 400 }
-        );
-      }
-    } else if (typeof recordingUrlInput === "string" && recordingUrlInput.trim().length > 0) {
-      sourceType = "url";
-      sourceName = recordingUrlInput.trim();
-      file = await recordingUrlToFile(recordingUrlInput.trim());
+    if (hasFile) {
+      const file = maybeFile as File;
+      buffer = Buffer.from(await file.arrayBuffer());
+      filename = file.name || "recording.mp3";
+      mimeType = file.type || "audio/mpeg";
+    } else {
+      const remote = await fetchRemoteRecording(recordingUrl);
+      buffer = remote.buffer;
+      filename = remote.filename;
+      mimeType = remote.mimeType;
     }
 
-    if (!file) {
-      return NextResponse.json(
-        { error: "Provide an .mp3/.mp4 upload or a recording URL." },
-        { status: 400 }
-      );
-    }
-
-    const { transcript, durationSeconds, language } = await transcribeMeeting(file);
-
-    const meeting = createMeeting({
-      ownerEmail: session.email,
-      sourceType,
-      sourceName,
-      durationSeconds,
-      transcript
+    const transcription = await transcribeMeetingAudio({
+      buffer,
+      filename,
+      mimeType,
     });
 
-    recordUsage(session.email, durationSeconds);
+    await updateJobTranscription(job.id, transcription);
 
     return NextResponse.json({
-      meetingId: meeting.id,
-      durationSeconds,
-      language,
-      transcriptPreview: transcript.slice(0, 300)
+      jobId: job.id,
+      transcription,
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Transcription failed unexpectedly.";
-    return NextResponse.json({ error: message }, { status: 500 });
+    const message = humanizeError(error);
+    await markJobFailed(job.id, message);
+
+    return NextResponse.json(
+      {
+        error: message,
+      },
+      { status: 500 },
+    );
   }
 }

@@ -1,6 +1,6 @@
-node_modules
 .next
+node_modules
 .env
 .env.local
 .DS_Store
-.data
+data/store.json
